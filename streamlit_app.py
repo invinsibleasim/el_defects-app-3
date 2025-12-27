@@ -1,4 +1,16 @@
 
+try:
+    import cv2
+except Exception as e:
+    import streamlit as st
+    st.error(
+        "Failed to import OpenCV (cv2). "
+        "On Streamlit Cloud, add 'libgl1' and 'libglib2.0-0' to packages.txt, "
+        "and use 'opencv-python-headless' in requirements.txt.\n\n"
+        f"Error:\n{e}"
+    )
+    st.stop()
+
 import os
 import io
 import cv2
