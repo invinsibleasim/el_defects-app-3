@@ -8,12 +8,13 @@ streamlit
 #numpy
 #pandas
 #tqdm
-#opencv-python
+opencv-python
 #opencv-python>=4.1.2
-torch>=1.8
+#torch>=1.8
+torch
 #streamlit>=1.31.0
-opencv-python-headless
-#opencv-python-headless>=4.8.0
+#opencv-python-headless
+opencv-python-headless>=4.8.0
 pillow>=10.0.0
 pandas>=2.0.0
 numpy>=1.24.0
