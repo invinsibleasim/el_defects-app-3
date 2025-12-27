@@ -1,6 +1,8 @@
-streamlit
-numpy
-Pillow
-scikit-image
-scipy
+
+streamlit==1.39.0
+numpy==1.26.4
+Pillow==10.3.0
+scikit-image==0.22.0
+scipy==1.11.4
+
 
