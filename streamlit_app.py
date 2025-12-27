@@ -2,8 +2,8 @@
 import os
 import io
 import cv2
-import json
 import time
+import json
 import zipfile
 import numpy as np
 import streamlit as st
@@ -11,21 +11,17 @@ from PIL import Image
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
-# Optional: only import ultralytics when running inference to avoid slow startup
-from ultralytics import YOLO
-
-# ---------------------------
-# Utility Functions
-# ---------------------------
+# ---------------------------------------
+# Utilities
+# ---------------------------------------
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
 
 def pil_to_cv(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 def cv_to_pil(img: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-def ensure_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
 
 def save_image(path: Path, image: np.ndarray, quality: int = 95):
     ensure_dir(path.parent)
@@ -39,56 +35,136 @@ def zip_directory(src_dir: Path, zip_path: Path):
                 fp = Path(root) / f
                 zf.write(fp, fp.relative_to(src_dir))
 
-def normalize_image_for_grid(img_bgr: np.ndarray) -> np.ndarray:
+# ---------------------------------------
+# EL-specific preprocessing
+# ---------------------------------------
+def normalize_el(img_bgr: np.ndarray, clahe_clip: float = 2.5, tile: int = 8, blur_ksize: int = 3) -> np.ndarray:
     """
-    Normalize brightness/contrast to enhance busbars/grid-lines. Works for EL/IR/visible images.
+    Normalize EL image to enhance gridlines/busbars.
+    EL images often have bright cells, dark cracks/lines.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # CLAHE to normalize contrast
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(tile, tile))
     gray_norm = clahe.apply(gray)
-    # Slight Gaussian blur to reduce speckle
-    gray_blur = cv2.GaussianBlur(gray_norm, (3, 3), 0)
-    return gray_blur
+    if blur_ksize > 0:
+        gray_norm = cv2.GaussianBlur(gray_norm, (blur_ksize, blur_ksize), 0)
+    return gray_norm
 
+def auto_deskew(img_bgr: np.ndarray, gray: np.ndarray, hough_thresh: int = 120) -> np.ndarray:
+    """
+    Estimate dominant angle of lines and rotate to align vertical/horizontal grid.
+    """
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi/180, hough_thresh)
+    if lines is None:
+        return img_bgr
+    angles = []
+    for l in lines[:200]:
+        theta = l[0][1]
+        # Convert to degrees, normalize around 0/90
+        deg = np.rad2deg(theta)
+        # Map to [-90, 90)
+        deg = ((deg + 90) % 180) - 90
+        angles.append(deg)
+    if len(angles) == 0:
+        return img_bgr
+    # Find mean angle near 0 or 90 multiples
+    mean_angle = float(np.mean(angles))
+    # Rotate by -mean_angle
+    h, w = img_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w/2, h/2), -mean_angle, 1.0)
+    rotated = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def perspective_warp(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Try to find module contour (largest quadrilateral) and warp to a rectangle.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img_bgr
+    cnt = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+    if len(approx) != 4:
+        return img_bgr
+    # Order points
+    pts = approx.reshape(4, 2).astype(np.float32)
+    # Order in top-left, top-right, bottom-right, bottom-left
+    # via sum and diff
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).flatten()
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
+    rect = np.array([tl, tr, br, bl], dtype=np.float32)
+    # Compute target size by distances
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxW = int(max(widthA, widthB))
+    maxH = int(max(heightA, heightB))
+    if maxW < 100 or maxH < 100:
+        return img_bgr
+    dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(img_bgr, M, (maxW, maxH), flags=cv2.INTER_LINEAR)
+    return warped
+
+# ---------------------------------------
+# Grid line detection + cell building
+# ---------------------------------------
 def detect_grid_lines(gray: np.ndarray,
+                      polarity: str = "auto",
+                      binarize: str = "otsu",
                       ksize_v: int = 25,
-                      ksize_h: int = 25,
-                      thresh: int = 150) -> Tuple[np.ndarray, np.ndarray]:
+                      ksize_h: int = 25) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Detect vertical and horizontal line maps using morphological operations.
+    Detect vertical/horizontal line maps using morphology.
+    polarity: 'auto' | 'dark' | 'bright' (lines)
+    binarize: 'otsu' | 'adaptive'
     """
-    # Binary threshold (adaptive can be used too)
-    _, bw = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-
-    # Invert if lines are dark
-    # Decide polarity based on mean
-    if np.mean(gray) > 127:  # bright background
-        bw_inv = 255 - bw
+    if binarize == "adaptive":
+        bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, 31, 5)
     else:
-        bw_inv = bw
+        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    # Determine if lines are dark or bright relative to background
+    if polarity == "auto":
+        # If mean is high (bright cells), lines likely dark → invert bw to highlight lines
+        use = 255 - bw if np.mean(gray) > 127 else bw
+    elif polarity == "dark":
+        use = 255 - bw
+    else:
+        use = bw
 
     # Vertical lines
     kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, ksize_v))
-    vert = cv2.erode(bw_inv, kernel_v, iterations=1)
+    vert = cv2.erode(use, kernel_v, iterations=1)
     vert = cv2.dilate(vert, kernel_v, iterations=1)
 
     # Horizontal lines
     kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize_h, 1))
-    horiz = cv2.erode(bw_inv, kernel_h, iterations=1)
+    horiz = cv2.erode(use, kernel_h, iterations=1)
     horiz = cv2.dilate(horiz, kernel_h, iterations=1)
 
     return vert, horiz
 
 def project_peaks(line_map: np.ndarray, axis: int = 0, min_dist: int = 30, min_strength: float = 0.3) -> List[int]:
     """
-    Find peaks along projections of line_map (sum over rows/cols).
-    axis=0 for vertical lines (sum over rows → column projection),
-    axis=1 for horizontal lines (sum over cols → row projection).
+    Find peaks along projections of line_map.
+    axis=0 for vertical lines (column projection),
+    axis=1 for horizontal lines (row projection).
     """
     proj = line_map.sum(axis=axis)
+    # Normalize to [0,1]
     proj_norm = (proj - proj.min()) / (proj.max() - proj.min() + 1e-6)
-    # Simple peak picking: local maxima with min distance
     peaks = []
     last_idx = -min_dist
     for i in range(1, len(proj_norm) - 1):
@@ -98,31 +174,31 @@ def project_peaks(line_map: np.ndarray, axis: int = 0, min_dist: int = 30, min_s
                 last_idx = i
     return peaks
 
+def cuts_from_peaks(peaks: List[int], maxlen: int) -> List[int]:
+    """
+    Convert peak positions (lines) to cut boundaries between cells.
+    """
+    if len(peaks) < 2:
+        # Fallback to edges
+        return [0, maxlen - 1]
+    cuts = [0]
+    for i in range(len(peaks) - 1):
+        cuts.append((peaks[i] + peaks[i + 1]) // 2)
+    cuts.append(maxlen - 1)
+    cuts = sorted(list(set(cuts)))
+    return cuts
+
 def build_cells_from_grid(img_bgr: np.ndarray,
                           vert_map: np.ndarray,
                           horiz_map: np.ndarray,
                           min_cell_w: int = 40,
                           min_cell_h: int = 40) -> List[Dict[str, Any]]:
-    """
-    Construct cell bounding boxes from vertical/horizontal splits.
-    Returns list of dicts with bbox and cropped images.
-    """
     H, W = vert_map.shape
     xs = project_peaks(vert_map, axis=0, min_dist=max(20, W // 30))
     ys = project_peaks(horiz_map, axis=1, min_dist=max(20, H // 30))
 
-    # Convert peak positions to cuts (intermediate between lines)
-    def to_cuts(peaks: List[int], maxlen: int) -> List[int]:
-        cuts = [0]
-        for i in range(len(peaks) - 1):
-            cuts.append((peaks[i] + peaks[i + 1]) // 2)
-        cuts.append(maxlen - 1)
-        # Remove duplicates, ensure sorted
-        cuts = sorted(list(set(cuts)))
-        return cuts
-
-    xcuts = to_cuts(xs, W)
-    ycuts = to_cuts(ys, H)
+    xcuts = cuts_from_peaks(xs, W)
+    ycuts = cuts_from_peaks(ys, H)
 
     cells = []
     for r in range(len(ycuts) - 1):
@@ -147,302 +223,193 @@ def overlay_grid(img_bgr: np.ndarray, cells: List[Dict[str, Any]], color=(0, 255
         cv2.rectangle(vis, (x0, y0), (x1, y1), color, thickness)
     return vis
 
-def run_yolo_on_image(model: YOLO,
-                      img_bgr: np.ndarray,
-                      conf: float = 0.25,
-                      iou: float = 0.45,
-                      task_type: str = "detect") -> Dict[str, Any]:
+def manual_split(img_bgr: np.ndarray, n_rows: int, n_cols: int, margin: int = 0) -> List[Dict[str, Any]]:
     """
-    Run YOLO on an image and return parsed results.
-    Supports 'detect' (boxes) and 'segment' (masks).
+    Fallback: evenly split the image into n_rows x n_cols cells (optionally trimming margin).
     """
-    # Ultralytics expects RGB
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    results = model.predict(source=img_rgb, conf=conf, iou=iou, verbose=False)
-    out = {"boxes": [], "masks": [], "classes": [], "scores": []}
-    if not results:
-        return out
+    h, w = img_bgr.shape[:2]
+    x0, y0 = margin, margin
+    x1, y1 = w - margin, h - margin
+    cell_w = (x1 - x0) // n_cols
+    cell_h = (y1 - y0) // n_rows
+    cells = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cx0 = x0 + c * cell_w
+            cy0 = y0 + r * cell_h
+            cx1 = cx0 + cell_w
+            cy1 = cy0 + cell_h
+            crop = img_bgr[cy0:cy1, cx0:cx1].copy()
+            cells.append({
+                "row": r,
+                "col": c,
+                "bbox": (cx0, cy0, cx1, cy1),
+                "image": crop
+            })
+    return cells
 
-    r = results[0]
-    # Boxes
-    if r.boxes is not None:
-        for b in r.boxes:
-            xyxy = b.xyxy.cpu().numpy().astype(int)[0]  # [x1,y1,x2,y2]
-            cls_id = int(b.cls.cpu().numpy()[0])
-            score = float(b.conf.cpu().numpy()[0])
-            out["boxes"].append(xyxy.tolist())
-            out["classes"].append(cls_id)
-            out["scores"].append(score)
-
-    # Masks (seg models)
-    if task_type == "segment" and r.masks is not None and r.masks.data is not None:
-        # r.masks.data is [N, H, W] normalized
-        masks = r.masks.data.cpu().numpy()
-        for m in masks:
-            out["masks"].append((m > 0.5).astype(np.uint8))  # binary
-
-    return out
-
-def color_for_class(cls_id: int) -> Tuple[int, int, int]:
-    # Simple deterministic color palette
-    np.random.seed(cls_id + 7)
-    c = np.random.randint(0, 255, size=3).tolist()
-    return (int(c[0]), int(c[1]), int(c[2]))
-
-def overlay_detections(img_bgr: np.ndarray,
-                       detections: Dict[str, Any],
-                       class_names: List[str],
-                       task_type: str = "detect",
-                       alpha: float = 0.4) -> np.ndarray:
-    """
-    Draw boxes or masks + labels on image.
-    """
-    vis = img_bgr.copy()
-
-    if task_type == "detect":
-        for box, cls_id, score in zip(detections["boxes"], detections["classes"], detections["scores"]):
-            x1, y1, x2, y2 = box
-            color = color_for_class(cls_id)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = f"{class_names[cls_id] if cls_id < len(class_names) else cls_id}: {score:.2f}"
-            cv2.putText(vis, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-
-    elif task_type == "segment":
-        overlay = np.zeros_like(vis)
-        for idx, (mask, cls_id, score) in enumerate(zip(detections["masks"], detections["classes"], detections["scores"])):
-            color = np.array(color_for_class(cls_id), dtype=np.uint8)
-            # Broadcast color over mask
-            colored_mask = np.zeros_like(vis)
-            for ch in range(3):
-                colored_mask[:, :, ch] = mask * color[ch]
-            overlay = cv2.add(overlay, colored_mask)
-            # draw a label at centroid
-            ys, xs = np.where(mask > 0)
-            if len(xs) > 0:
-                x_c, y_c = int(xs.mean()), int(ys.mean())
-                label = f"{class_names[cls_id] if cls_id < len(class_names) else cls_id}: {score:.2f}"
-                cv2.putText(vis, label, (x_c, y_c), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        vis = cv2.addWeighted(vis, 1.0, overlay, alpha, 0)
-
-    return vis
-
-def process_module_image(img_pil: Image.Image,
-                         model_path: Path,
-                         task_type: str,
-                         conf: float,
-                         iou: float,
-                         grid_params: Dict[str, Any],
-                         class_names: List[str],
-                         save_dir: Path,
-                         save_masks: bool = True) -> Dict[str, Any]:
-    """
-    Full pipeline for one module image: split cells, run YOLO per cell, overlay & save.
-    """
-    t0 = time.time()
-    ensure_dir(save_dir)
-    img_bgr = pil_to_cv(img_pil)
-    gray = normalize_image_for_grid(img_bgr)
-    vert, horiz = detect_grid_lines(
-        gray,
-        ksize_v=grid_params.get("ksize_v", 25),
-        ksize_h=grid_params.get("ksize_h", 25),
-        thresh=grid_params.get("thresh", 0)
-    )
-    cells = build_cells_from_grid(
-        img_bgr,
-        vert,
-        horiz,
-        min_cell_w=grid_params.get("min_cell_w", 40),
-        min_cell_h=grid_params.get("min_cell_h", 40)
-    )
-
-    # Visualization of cell grid
-    grid_overlay = overlay_grid(img_bgr, cells)
-    save_image(save_dir / "module_grid.jpg", grid_overlay)
-
-    # Load YOLO model
-    model = YOLO(str(model_path))
-
-    results_summary = []
-    cells_dir = save_dir / "cells"
-    ensure_dir(cells_dir)
-
-    defects_dir = save_dir / "defects_overlay"
-    ensure_dir(defects_dir)
-
-    masks_dir = save_dir / "masks"
-    ensure_dir(masks_dir)
-
-    for idx, cell in enumerate(cells):
-        crop_bgr = cell["image"]
-        det = run_yolo_on_image(model, crop_bgr, conf=conf, iou=iou, task_type=task_type)
-        # Overlay defects on cell
-        overlay = overlay_detections(crop_bgr, det, class_names, task_type)
-        save_image(cells_dir / f"cell_{cell['row']:02d}_{cell['col']:02d}.jpg", crop_bgr)
-        save_image(defects_dir / f"cell_{cell['row']:02d}_{cell['col']:02d}_overlay.jpg", overlay)
-
-        # Save masks if segmentation
-        if task_type == "segment" and save_masks and len(det["masks"]) > 0:
-            # Save each mask as PNG
-            for m_i, mask in enumerate(det["masks"]):
-                mask_img = (mask * 255).astype(np.uint8)
-                cv2.imwrite(str(masks_dir / f"cell_{cell['row']:02d}_{cell['col']:02d}_mask_{m_i}.png"), mask_img)
-
-        # Collect summary
-        results_summary.append({
-            "row": cell["row"],
-            "col": cell["col"],
-            "bbox": cell["bbox"],
-            "num_defects": len(det["boxes"]) if task_type == "detect" else len(det["masks"]),
-            "classes": det["classes"],
-            "scores": det["scores"]
-        })
-
-    # Save JSON summary
-    with open(save_dir / "summary.json", "w") as f:
-        json.dump({
-            "n_cells": len(cells),
-            "results": results_summary
-        }, f, indent=2)
-
-    elapsed = time.time() - t0
-    return {
-        "cells": cells,
-        "grid_overlay": grid_overlay,
-        "summary": results_summary,
-        "elapsed": elapsed,
-        "n_cells": len(cells)
-    }
-
-# ---------------------------
+# ---------------------------------------
 # Streamlit UI
-# ---------------------------
-
-st.set_page_config(page_title="PV Module Cell Segmentation & Defect Detection (YOLO)", layout="wide")
-
-st.title("🔍 PV Module → Cell Segmentation + Defect Detection (YOLO)")
+# ---------------------------------------
+st.set_page_config(page_title="PV EL Module → Cell Segregation", layout="wide")
+st.title("🔬 PV EL Module → Cell Segregation (Streamlit)")
 
 st.markdown("""
-Upload PV module images (EL/IR/daylight), automatically **segregate PV cells**, and run a **YOLOv8** model to detect or segment defects.
-Outputs (cells, overlays, masks, JSON summary) are saved to the selected output folder.
+Upload **EL PV module** images to automatically detect the **cell grid** and export **per-cell crops**.
+If auto detection struggles, use the **Manual rows/columns** fallback.
 """)
 
-# Sidebar configuration
-st.sidebar.header("⚙️ Configuration")
+# Sidebar controls
+st.sidebar.header("⚙️ Settings")
 
-model_path_str = st.sidebar.text_input("YOLO model path (.pt)", "models/yolov8-pv-defects.pt")
-task_type = st.sidebar.selectbox("YOLO task type", ["detect", "segment"], index=0)
-conf = st.sidebar.slider("Confidence threshold (conf)", 0.05, 0.95, 0.25, 0.05)
-iou = st.sidebar.slider("IoU threshold (NMS)", 0.10, 0.95, 0.45, 0.05)
+# Preprocessing
+clahe_clip = st.sidebar.slider("CLAHE clipLimit", 1.0, 4.0, 2.5, 0.1)
+clahe_tile = st.sidebar.slider("CLAHE tile size", 4, 16, 8, 1)
+blur_ksize = st.sidebar.slider("Gaussian blur (ksize)", 0, 7, 3, 1)
 
-st.sidebar.subheader("Grid detection parameters")
+# Orientation correction
+do_warp = st.sidebar.checkbox("Perspective warp (try to rectangularize)", True)
+do_deskew = st.sidebar.checkbox("Auto deskew (align grid)", True)
+
+# Detection params
+polarity = st.sidebar.selectbox("Line polarity", ["auto", "dark", "bright"], index=0)
+binarize = st.sidebar.selectbox("Binarization", ["otsu", "adaptive"], index=0)
 ksize_v = st.sidebar.slider("Vertical kernel size", 5, 75, 25, 1)
 ksize_h = st.sidebar.slider("Horizontal kernel size", 5, 75, 25, 1)
 min_cell_w = st.sidebar.slider("Min cell width (px)", 20, 400, 40, 10)
 min_cell_h = st.sidebar.slider("Min cell height (px)", 20, 400, 40, 10)
-thresh = st.sidebar.slider("Threshold (0=OTSU)", 0, 255, 0, 1)
 
+# Fallback manual split
+use_manual = st.sidebar.checkbox("Use manual rows × cols fallback", False)
+n_rows = st.sidebar.number_input("Rows", min_value=1, max_value=20, value=6)
+n_cols = st.sidebar.number_input("Cols", min_value=1, max_value=24, value=10)
+manual_margin = st.sidebar.number_input("Manual margin (px)", min_value=0, max_value=200, value=0)
+
+# Output options
 out_dir_str = st.sidebar.text_input("Output directory", "output")
-save_masks = st.sidebar.checkbox("Save segmentation masks (for segment models)", True)
-
-class_names_str = st.sidebar.text_area("Class names (comma-separated)", "crack, hotspot, snail_trail, finger_break, inactive_area")
-class_names = [c.strip() for c in class_names_str.split(",") if c.strip()]
-
-st.sidebar.markdown("---")
-batch_mode = st.sidebar.checkbox("Batch mode (process all images in a folder)", False)
 start_btn = st.sidebar.button("🚀 Run")
 
-# File uploader(s)
-if not batch_mode:
-    uploads = st.file_uploader("Upload module image(s)", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"], accept_multiple_files=True)
-else:
-    st.info("Batch mode: All images in the specified input folder will be processed.")
-    input_dir_str = st.text_input("Input folder path", "input")
+# Uploader
+uploads = st.file_uploader("Upload EL module image(s)", type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"], accept_multiple_files=True)
 
-# Main logic
+# ---------------------------------------
+# Processing
+# ---------------------------------------
+def process_single_image(img_pil: Image.Image,
+                         settings: Dict[str, Any],
+                         save_root: Path) -> Dict[str, Any]:
+    t0 = time.time()
+    img_bgr = pil_to_cv(img_pil)
+
+    # Orientation correction first (to improve grid detection)
+    if settings["do_warp"]:
+        img_bgr = perspective_warp(img_bgr)
+
+    # Preprocess for EL
+    gray_norm = normalize_el(img_bgr,
+                             clahe_clip=settings["clahe_clip"],
+                             tile=settings["clahe_tile"],
+                             blur_ksize=settings["blur_ksize"])
+
+    if settings["do_deskew"]:
+        img_bgr = auto_deskew(img_bgr, gray_norm)
+        gray_norm = normalize_el(img_bgr,
+                                 clahe_clip=settings["clahe_clip"],
+                                 tile=settings["clahe_tile"],
+                                 blur_ksize=settings["blur_ksize"])
+
+    # Auto detection or manual
+    if not settings["use_manual"]:
+        vert_map, horiz_map = detect_grid_lines(gray_norm,
+                                                polarity=settings["polarity"],
+                                                binarize=settings["binarize"],
+                                                ksize_v=settings["ksize_v"],
+                                                ksize_h=settings["ksize_h"])
+        cells = build_cells_from_grid(img_bgr, vert_map, horiz_map,
+                                      min_cell_w=settings["min_cell_w"],
+                                      min_cell_h=settings["min_cell_h"])
+    else:
+        cells = manual_split(img_bgr, n_rows=settings["n_rows"], n_cols=settings["n_cols"], margin=settings["manual_margin"])
+
+    grid_overlay = overlay_grid(img_bgr, cells)
+
+    # Save outputs
+    ensure_dir(save_root)
+    save_image(save_root / "module_grid.jpg", grid_overlay)
+    cells_dir = save_root / "cells"
+    ensure_dir(cells_dir)
+    meta = []
+    for cell in cells:
+        r, c = cell["row"], cell["col"]
+        save_image(cells_dir / f"cell_{r:02d}_{c:02d}.jpg", cell["image"])
+        meta.append({
+            "row": r,
+            "col": c,
+            "bbox": cell["bbox"]
+        })
+
+    # Summary JSON
+    with open(save_root / "summary.json", "w") as f:
+        json.dump({"n_cells": len(cells), "cells": meta}, f, indent=2)
+
+    return {
+        "n_cells": len(cells),
+        "grid_overlay": grid_overlay,
+        "cells": cells,
+        "elapsed": time.time() - t0
+    }
+
+# Run pipeline
 if start_btn:
     out_base = Path(out_dir_str)
     ensure_dir(out_base)
-    model_path = Path(model_path_str)
-
-    if not model_path.exists():
-        st.error(f"Model not found at: {model_path}. Please provide a valid .pt file.")
+    if not uploads:
+        st.warning("Please upload at least one image.")
     else:
-        if batch_mode:
-            input_dir = Path(input_dir_str)
-            if not input_dir.exists():
-                st.error(f"Input dir not found: {input_dir}")
-            else:
-                images = []
-                for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff"]:
-                    images.extend(list(input_dir.glob(ext)))
-                if not images:
-                    st.warning("No images found in input folder.")
-                else:
-                    st.write(f"Found {len(images)} images. Processing...")
-                    progress = st.progress(0.0)
-                    for i, img_path in enumerate(images):
-                        img_pil = Image.open(img_path).convert("RGB")
-                        save_dir = out_base / img_path.stem
-                        res = process_module_image(
-                            img_pil=img_pil,
-                            model_path=model_path,
-                            task_type=task_type,
-                            conf=conf,
-                            iou=iou,
-                            grid_params={
-                                "ksize_v": ksize_v,
-                                "ksize_h": ksize_h,
-                                "min_cell_w": min_cell_w,
-                                "min_cell_h": min_cell_h,
-                                "thresh": thresh
-                            },
-                            class_names=class_names,
-                            save_dir=save_dir,
-                            save_masks=save_masks
-                        )
-                        st.write(f"**{img_path.name}** → {res['n_cells']} cells, time: {res['elapsed']:.2f}s")
-                        # Show grid overlay
-                        st.image(cv_to_pil(res["grid_overlay"]), caption=f"Grid overlay: {img_path.name}", use_column_width=True)
-                        progress.progress((i + 1) / len(images))
-                    # Zip
-                    zip_path = out_base / "batch_results.zip"
-                    zip_directory(out_base, zip_path)
-                    with open(zip_path, "rb") as f:
-                        st.download_button("📦 Download all results (ZIP)", data=f, file_name="batch_results.zip")
-        else:
-            if not uploads:
-                st.warning("Please upload at least one image.")
-            else:
-                for upl in uploads:
-                    img_pil = Image.open(io.BytesIO(upl.read())).convert("RGB")
-                    save_dir = out_base / Path(upl.name).stem
-                    res = process_module_image(
-                        img_pil=img_pil,
-                        model_path=model_path,
-                        task_type=task_type,
-                        conf=conf,
-                        iou=iou,
-                        grid_params={
-                            "ksize_v": ksize_v,
-                            "ksize_h": ksize_h,
-                            "min_cell_w": min_cell_w,
-                            "min_cell_h": min_cell_h,
-                            "thresh": thresh
-                        },
-                        class_names=class_names,
-                        save_dir=save_dir,
-                        save_masks=save_masks
-                    )
-                    st.success(f"Processed {upl.name}: {res['n_cells']} cells found in {res['elapsed']:.2f}s")
-                    # Show grid overlay
-                    st.image(cv_to_pil(res["grid_overlay"]), caption=f"Grid overlay: {upl.name}", use_column_width=True)
+        for upl in uploads:
+            img_pil = Image.open(io.BytesIO(upl.read())).convert("RGB")
+            save_dir = out_base / Path(upl.name).stem
+            res = process_single_image(
+                img_pil,
+                settings={
+                    "clahe_clip": clahe_clip,
+                    "clahe_tile": clahe_tile,
+                    "blur_ksize": blur_ksize,
+                    "do_warp": do_warp,
+                    "do_deskew": do_deskew,
+                    "polarity": polarity,
+                    "binarize": binarize,
+                    "ksize_v": ksize_v,
+                    "ksize_h": ksize_h,
+                    "min_cell_w": min_cell_w,
+                    "min_cell_h": min_cell_h,
+                    "use_manual": use_manual,
+                    "n_rows": int(n_rows),
+                    "n_cols": int(n_cols),
+                    "manual_margin": int(manual_margin)
+                },
+                save_root=save_dir
+            )
+            st.success(f"Processed {upl.name}: {res['n_cells']} cells in {res['elapsed']:.2f}s")
+            st.image(cv_to_pil(res["grid_overlay"]), caption=f"Grid overlay: {upl.name}", use_column_width=True)
 
-                    # Let user download per-image zip
-                    zip_path = save_dir / f"{Path(upl.name).stem}_results.zip"
-                    zip_directory(save_dir, zip_path)
-                    with open(zip_path, "rb") as f:
-                        st.download_button(f"📦 Download results for {upl.name}", data=f, file_name=zip_path.name)
+            # Show a selection of cropped cells in a grid
+            cols_show = st.columns(min(6, max(1, int(n_cols))))
+            preview_count = min(len(res["cells"]), 12)
+            for i in range(preview_count):
+                r, c = res["cells"][i]["row"], res["cells"][i]["col"]
+                cols_show[i % len(cols_show)].image(
+                    cv_to_pil(res["cells"][i]["image"]),
+                    caption=f"Cell r{r} c{c}",
+                    use_column_width=True
+                )
+
+            # Per-image ZIP download
+            zip_path = save_dir / f"{Path(upl.name).stem}_cells.zip"
+            zip_directory(save_dir, zip_path)
+            with open(zip_path, "rb") as f:
+                st.download_button(f"📦 Download crops for {upl.name}", data=f, file_name=zip_path.name)
 
 st.markdown("---")
-st.caption("Tip: Tune kernel sizes and thresholds for different image modalities (EL/IR/visible). Use YOLO segmentation for polygon masks.")
+st.caption("Tips: For EL images, gridlines/busbars are typically darker than cells. Increase kernel sizes if lines are faint; use 'adaptive' threshold for non-uniform brightness.")
+``
