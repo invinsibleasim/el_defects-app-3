@@ -8,7 +8,7 @@ streamlit
 #numpy
 #pandas
 #tqdm
-opencv-python
+#opencv-python
 #opencv-python>=4.1.2
 torch>=1.8
 #streamlit>=1.31.0
@@ -25,5 +25,5 @@ requests>=2.31.0
 tqdm>=4.66.0
 #streamlit
 #... other dependencies
-#opencv-python 
+opencv-python 
 #or use opencv-python-headless if you don't use cv2.imshow
