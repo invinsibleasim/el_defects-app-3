@@ -32,3 +32,4 @@ streamlit
 opencv-python 
 pillow 
 numpy
+libgl1
