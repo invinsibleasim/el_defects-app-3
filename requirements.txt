@@ -21,3 +21,7 @@ matplotlib>=3.7.0
 seaborn>=0.12.0
 requests>=2.31.0
 tqdm>=4.66.0
+#streamlit
+# ... other dependencies
+opencv-python 
+#or use opencv-python-headless if you don't use cv2.imshow
