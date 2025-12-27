@@ -412,4 +412,3 @@ if start_btn:
 
 st.markdown("---")
 st.caption("Tips: For EL images, gridlines/busbars are typically darker than cells. Increase kernel sizes if lines are faint; use 'adaptive' threshold for non-uniform brightness.")
-``
