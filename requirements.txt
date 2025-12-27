@@ -1,29 +1,6 @@
-#streamlit
-#opencv-python-headless
-#numpy
-#Pillow
-#streamlit
-#torch>=1.8
-#opencv-python-headless
-#seaborn
-# Add other dependencies here, e.g.,
-#pandas
-#matplotlib
-#numpy
-#pandas
-#tqdm
-numpy
-opencv-python
-torch>=1.8
-streamlit>=1.31.0
-opencv-python-headless>=4.8.0
-pillow>=10.0.0
-pandas>=2.0.0
-numpy>=1.24.0
 
-# Add plotting & utilities often imported by yolov5
-matplotlib>=3.7.0
-seaborn>=0.12.0
-requests>=2.31.0
-tqdm>=4.66.0
-
+streamlit==1.39.0
+numpy==1.26.4
+Pillow==10.3.0
+scikit-image==0.22.0
+scipy==1.11.
