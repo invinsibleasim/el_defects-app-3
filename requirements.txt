@@ -8,12 +8,12 @@ streamlit
 #numpy
 #pandas
 #tqdm
-#opencv-python
-opencv-python>=4.1.2
+opencv-python
+#opencv-python>=4.1.2
 torch>=1.8
 #streamlit>=1.31.0
-#opencv-python-headless
-opencv-python-headless>=4.8.0
+opencv-python-headless
+#opencv-python-headless>=4.8.0
 pillow>=10.0.0
 pandas>=2.0.0
 numpy>=1.24.0
@@ -27,3 +27,4 @@ tqdm>=4.66.0
 #... other dependencies
 #opencv-python 
 #or use opencv-python-headless if you don't use cv2.imshow
+libgl1-mesa-glx
