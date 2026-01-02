@@ -1,5 +1,44 @@
+#ultralytics
+#streamlit>=1.31.0
+#opencv-python-headless>=4.9.0.80
+#pillow>=10.0.0
+#pandas>=2.0.0
+#numpy>=1.24.0
+#opencv-python
+#opencv-contrib-python==4.9.0.80
+#streamlit
+#opencv-python-headless
+#numpy
+#Pillow
+# YOLOv11 requirements
+#Usage: pip install -r requirements.txt
+
+# Base ----------------------------------------
+#matplotlib>=3.2.2
+#numpy>=1.18.5
+#opencv-python-headless>=4.7
+#Pillow>=7.1.2
+#PyYAML>=5.3.1
+#requests>=2.23.0
+#scipy>=1.4.1  # Google Colab version
+#torch>=1.7.0
+#torchvision>=0.8.1
+#tqdm>=4.41.0
+#protobuf<4.21.5  # https://github.com/ultralytics/yolov5/issues/8012
 streamlit>=1.20
 opencv-python-headless>=4.7
-numpy>=1.23
+#numpy>=1.23
 pillow>=9.0
 scikit-image>=0.19
+
+# Plotting ------------------------------------
+pandas>=1.1.4
+seaborn>=0.11.0
+
+
+# Extras --------------------------------------
+ipython  # interactive notebook
+psutil  # system utilization
+thop  # FLOPs computation
+streamlit
+wget
