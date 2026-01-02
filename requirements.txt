@@ -1,12 +1,5 @@
-torch>=1.8
-streamlit>=1.31.0
-opencv-python-headless>=4.8.0
-pillow>=10.0.0
-pandas>=2.0.0
-numpy>=1.24.0
-
-# Add plotting & utilities often imported by yolov5
-matplotlib>=3.7.0
-seaborn>=0.12.0
-requests>=2.31.0
-tqdm>=4.66.0
+streamlit>=1.20
+opencv-python-headless>=4.7
+numpy>=1.23
+pillow>=9.0
+scikit-image>=0.19
