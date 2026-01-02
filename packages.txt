@@ -3,3 +3,5 @@ libgl1
 libglib2.0-0
 # Optional (good to have on older images)
 libstdc++6
+libgl1-mesa-glx
+libglib2.0-0
